@@ -301,6 +301,7 @@ func TestNodeProposeAddDuplicateNode(t *testing.T) {
 	n.Campaign(context.TODO())
 	rdyEntries := make([]raftpb.Entry, 0)
 	ticker := time.NewTicker(time.Millisecond * 100)
+	defer ticker.Stop()
 	done := make(chan struct{})
 	stop := make(chan struct{})
 	applyConfChan := make(chan struct{})
@@ -350,7 +351,7 @@ func TestNodeProposeAddDuplicateNode(t *testing.T) {
 	<-done
 
 	if len(rdyEntries) != 4 {
-		t.Errorf("len(entry) = %d, want %d, %v\n", len(rdyEntries), 3, rdyEntries)
+		t.Errorf("len(entry) = %d, want %d, %v\n", len(rdyEntries), 4, rdyEntries)
 	}
 	if !bytes.Equal(rdyEntries[1].Data, ccdata1) {
 		t.Errorf("data = %v, want %v", rdyEntries[1].Data, ccdata1)
@@ -402,7 +403,11 @@ func TestNodeTick(t *testing.T) {
 	go n.run(r)
 	elapsed := r.electionElapsed
 	n.Tick()
-	testutil.WaitSchedule()
+
+	for len(n.tickc) != 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	n.Stop()
 	if r.electionElapsed != elapsed+1 {
 		t.Errorf("elapsed = %d, want %d", r.electionElapsed, elapsed+1)
@@ -422,9 +427,7 @@ func TestNodeStop(t *testing.T) {
 		close(donec)
 	}()
 
-	elapsed := r.electionElapsed
-	n.Tick()
-	testutil.WaitSchedule()
+	status := n.Status()
 	n.Stop()
 
 	select {
@@ -433,13 +436,15 @@ func TestNodeStop(t *testing.T) {
 		t.Fatalf("timed out waiting for node to stop!")
 	}
 
-	if r.electionElapsed != elapsed+1 {
-		t.Errorf("elapsed = %d, want %d", r.electionElapsed, elapsed+1)
+	emptyStatus := Status{}
+
+	if reflect.DeepEqual(status, emptyStatus) {
+		t.Errorf("status = %v, want not empty", status)
 	}
-	// Further ticks should have no effect, the node is stopped.
-	n.Tick()
-	if r.electionElapsed != elapsed+1 {
-		t.Errorf("elapsed = %d, want %d", r.electionElapsed, elapsed+1)
+	// Further status should return be empty, the node is stopped.
+	status = n.Status()
+	if !reflect.DeepEqual(status, emptyStatus) {
+		t.Errorf("status = %v, want empty", status)
 	}
 	// Subsequent Stops should have no effect.
 	n.Stop()
@@ -453,9 +458,9 @@ func TestReadyContainUpdates(t *testing.T) {
 		{Ready{}, false},
 		{Ready{SoftState: &SoftState{Lead: 1}}, true},
 		{Ready{HardState: raftpb.HardState{Vote: 1}}, true},
-		{Ready{Entries: make([]raftpb.Entry, 1, 1)}, true},
-		{Ready{CommittedEntries: make([]raftpb.Entry, 1, 1)}, true},
-		{Ready{Messages: make([]raftpb.Message, 1, 1)}, true},
+		{Ready{Entries: make([]raftpb.Entry, 1)}, true},
+		{Ready{CommittedEntries: make([]raftpb.Entry, 1)}, true},
+		{Ready{Messages: make([]raftpb.Message, 1)}, true},
 		{Ready{Snapshot: raftpb.Snapshot{Metadata: raftpb.SnapshotMetadata{Index: 1}}}, true},
 	}
 
@@ -487,11 +492,13 @@ func TestNodeStart(t *testing.T) {
 			CommittedEntries: []raftpb.Entry{
 				{Type: raftpb.EntryConfChange, Term: 1, Index: 1, Data: ccdata},
 			},
+			MustSync: true,
 		},
 		{
 			HardState:        raftpb.HardState{Term: 2, Commit: 3, Vote: 1},
 			Entries:          []raftpb.Entry{{Term: 2, Index: 3, Data: []byte("foo")}},
 			CommittedEntries: []raftpb.Entry{{Term: 2, Index: 3, Data: []byte("foo")}},
+			MustSync:         true,
 		},
 	}
 	storage := NewMemoryStorage()
@@ -544,6 +551,7 @@ func TestNodeRestart(t *testing.T) {
 		HardState: st,
 		// commit up to index commit index in st
 		CommittedEntries: entries[:st.Commit],
+		MustSync:         true,
 	}
 
 	storage := NewMemoryStorage()
@@ -588,6 +596,7 @@ func TestNodeRestartFromSnapshot(t *testing.T) {
 		HardState: st,
 		// commit up to index commit index in st
 		CommittedEntries: entries,
+		MustSync:         true,
 	}
 
 	s := NewMemoryStorage()

@@ -25,8 +25,6 @@ import (
 
 // watchBroadcast broadcasts a server watcher to many client watchers.
 type watchBroadcast struct {
-	// wbs is the backpointer to all broadcasts on this range
-	wbs *watchBroadcasts
 	// cancel stops the underlying etcd server watcher and closes ch.
 	cancel context.CancelFunc
 	donec  chan struct{}
@@ -52,27 +50,20 @@ func newWatchBroadcast(wp *watchProxy, w *watcher, update func(*watchBroadcast))
 	wb.add(w)
 	go func() {
 		defer close(wb.donec)
-		// loop because leader loss will close channel
-		for cctx.Err() == nil {
-			opts := []clientv3.OpOption{
-				clientv3.WithRange(w.wr.end),
-				clientv3.WithProgressNotify(),
-				clientv3.WithRev(wb.nextrev),
-				clientv3.WithPrevKV(),
-			}
-			// The create notification should be the first response;
-			// if the watch is recreated following leader loss, it
-			// shouldn't post a second create response to the client.
-			if wb.responses == 0 {
-				opts = append(opts, clientv3.WithCreatedNotify())
-			}
-			wch := wp.cw.Watch(cctx, w.wr.key, opts...)
 
-			for wr := range wch {
-				wb.bcast(wr)
-				update(wb)
-			}
-			wp.retryLimiter.Wait(cctx)
+		opts := []clientv3.OpOption{
+			clientv3.WithRange(w.wr.end),
+			clientv3.WithProgressNotify(),
+			clientv3.WithRev(wb.nextrev),
+			clientv3.WithPrevKV(),
+			clientv3.WithCreatedNotify(),
+		}
+
+		wch := wp.cw.Watch(cctx, w.wr.key, opts...)
+
+		for wr := range wch {
+			wb.bcast(wr)
+			update(wb)
 		}
 	}()
 	return wb
@@ -88,6 +79,9 @@ func (wb *watchBroadcast) bcast(wr clientv3.WatchResponse) {
 	wb.responses++
 	for r := range wb.receivers {
 		r.send(wr)
+	}
+	if len(wb.receivers) > 0 {
+		eventsCoalescing.Add(float64(len(wb.receivers) - 1))
 	}
 }
 
@@ -121,6 +115,8 @@ func (wb *watchBroadcast) add(w *watcher) bool {
 		return false
 	}
 	wb.receivers[w] = struct{}{}
+	watchersCoalescing.Inc()
+
 	return true
 }
 func (wb *watchBroadcast) delete(w *watcher) {
@@ -130,6 +126,10 @@ func (wb *watchBroadcast) delete(w *watcher) {
 		panic("deleting missing watcher from broadcast")
 	}
 	delete(wb.receivers, w)
+	if len(wb.receivers) > 0 {
+		// do not dec the only left watcher for coalescing.
+		watchersCoalescing.Dec()
+	}
 }
 
 func (wb *watchBroadcast) size() int {
@@ -141,6 +141,11 @@ func (wb *watchBroadcast) size() int {
 func (wb *watchBroadcast) empty() bool { return wb.size() == 0 }
 
 func (wb *watchBroadcast) stop() {
+	if !wb.empty() {
+		// do not dec the only left watcher for coalescing.
+		watchersCoalescing.Sub(float64(wb.size() - 1))
+	}
+
 	wb.cancel()
 	<-wb.donec
 }

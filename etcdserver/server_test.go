@@ -173,11 +173,13 @@ func TestApplyRepeat(t *testing.T) {
 			raftStorage: raft.NewMemoryStorage(),
 			storage:     mockstorage.NewStorageRecorder(""),
 			transport:   rafthttp.NewNopTransporter(),
+			ticker:      &time.Ticker{},
 		},
-		Cfg:      &ServerConfig{},
-		store:    st,
-		cluster:  cl,
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		Cfg:        &ServerConfig{},
+		store:      st,
+		cluster:    cl,
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
 	}
 	s.applyV2 = &applierV2store{store: s.store, cluster: s.cluster}
 	s.start()
@@ -613,7 +615,7 @@ func TestApplyMultiConfChangeShouldStop(t *testing.T) {
 		ents = append(ents, ent)
 	}
 
-	_, shouldStop := srv.apply(ents, &raftpb.ConfState{})
+	_, _, shouldStop := srv.apply(ents, &raftpb.ConfState{})
 	if !shouldStop {
 		t.Errorf("shouldStop = %t, want %t", shouldStop, true)
 	}
@@ -635,9 +637,11 @@ func TestDoProposal(t *testing.T) {
 				storage:     mockstorage.NewStorageRecorder(""),
 				raftStorage: raft.NewMemoryStorage(),
 				transport:   rafthttp.NewNopTransporter(),
+				ticker:      &time.Ticker{},
 			},
-			store:    st,
-			reqIDGen: idutil.NewGenerator(0, time.Time{}),
+			store:      st,
+			reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+			SyncTicker: &time.Ticker{},
 		}
 		srv.applyV2 = &applierV2store{store: srv.store, cluster: srv.cluster}
 		srv.start()
@@ -717,9 +721,12 @@ func TestDoProposalStopped(t *testing.T) {
 // TestSync tests sync 1. is nonblocking 2. proposes SYNC request.
 func TestSync(t *testing.T) {
 	n := newNodeRecorder()
+	ctx, cancel := context.WithCancel(context.TODO())
 	srv := &EtcdServer{
 		r:        raftNode{Node: n},
 		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 	srv.applyV2 = &applierV2store{store: srv.store, cluster: srv.cluster}
 
@@ -757,9 +764,12 @@ func TestSync(t *testing.T) {
 // after timeout
 func TestSyncTimeout(t *testing.T) {
 	n := newProposalBlockerRecorder()
+	ctx, cancel := context.WithCancel(context.TODO())
 	srv := &EtcdServer{
 		r:        raftNode{Node: n},
 		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 	srv.applyV2 = &applierV2store{store: srv.store, cluster: srv.cluster}
 
@@ -788,6 +798,7 @@ func TestSyncTimeout(t *testing.T) {
 func TestSyncTrigger(t *testing.T) {
 	n := newReadyNode()
 	st := make(chan time.Time, 1)
+	tk := &time.Ticker{C: st}
 	srv := &EtcdServer{
 		Cfg: &ServerConfig{TickMs: 1},
 		r: raftNode{
@@ -795,9 +806,10 @@ func TestSyncTrigger(t *testing.T) {
 			raftStorage: raft.NewMemoryStorage(),
 			transport:   rafthttp.NewNopTransporter(),
 			storage:     mockstorage.NewStorageRecorder(""),
+			ticker:      &time.Ticker{},
 		},
 		store:      mockstore.NewNop(),
-		SyncTicker: st,
+		SyncTicker: tk,
 		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
 	}
 
@@ -910,9 +922,11 @@ func TestTriggerSnap(t *testing.T) {
 			raftStorage: raft.NewMemoryStorage(),
 			storage:     p,
 			transport:   rafthttp.NewNopTransporter(),
+			ticker:      &time.Ticker{},
 		},
-		store:    st,
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		store:      st,
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
 	}
 	srv.applyV2 = &applierV2store{store: srv.store, cluster: srv.cluster}
 
@@ -979,9 +993,11 @@ func TestConcurrentApplyAndSnapshotV3(t *testing.T) {
 			storage:     mockstorage.NewStorageRecorder(testdir),
 			raftStorage: rs,
 			msgSnapC:    make(chan raftpb.Message, maxInFlightMsgSnap),
+			ticker:      &time.Ticker{},
 		},
-		store:   st,
-		cluster: cl,
+		store:      st,
+		cluster:    cl,
+		SyncTicker: &time.Ticker{},
 	}
 	s.applyV2 = &applierV2store{store: s.store, cluster: s.cluster}
 
@@ -1059,11 +1075,13 @@ func TestAddMember(t *testing.T) {
 			raftStorage: raft.NewMemoryStorage(),
 			storage:     mockstorage.NewStorageRecorder(""),
 			transport:   rafthttp.NewNopTransporter(),
+			ticker:      &time.Ticker{},
 		},
-		Cfg:      &ServerConfig{},
-		store:    st,
-		cluster:  cl,
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		Cfg:        &ServerConfig{},
+		store:      st,
+		cluster:    cl,
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
 	}
 	s.start()
 	m := membership.Member{ID: 1234, RaftAttributes: membership.RaftAttributes{PeerURLs: []string{"foo"}}}
@@ -1099,11 +1117,13 @@ func TestRemoveMember(t *testing.T) {
 			raftStorage: raft.NewMemoryStorage(),
 			storage:     mockstorage.NewStorageRecorder(""),
 			transport:   rafthttp.NewNopTransporter(),
+			ticker:      &time.Ticker{},
 		},
-		Cfg:      &ServerConfig{},
-		store:    st,
-		cluster:  cl,
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		Cfg:        &ServerConfig{},
+		store:      st,
+		cluster:    cl,
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
 	}
 	s.start()
 	err := s.RemoveMember(context.TODO(), 1234)
@@ -1138,10 +1158,12 @@ func TestUpdateMember(t *testing.T) {
 			raftStorage: raft.NewMemoryStorage(),
 			storage:     mockstorage.NewStorageRecorder(""),
 			transport:   rafthttp.NewNopTransporter(),
+			ticker:      &time.Ticker{},
 		},
-		store:    st,
-		cluster:  cl,
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		store:      st,
+		cluster:    cl,
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
 	}
 	s.start()
 	wm := membership.Member{ID: 1234, RaftAttributes: membership.RaftAttributes{PeerURLs: []string{"http://127.0.0.1:1"}}}
@@ -1169,15 +1191,20 @@ func TestPublish(t *testing.T) {
 	// simulate that request has gone through consensus
 	ch <- Response{}
 	w := wait.NewWithResponse(ch)
+	ctx, cancel := context.WithCancel(context.TODO())
 	srv := &EtcdServer{
 		readych:    make(chan struct{}),
 		Cfg:        &ServerConfig{TickMs: 1},
 		id:         1,
-		r:          raftNode{Node: n},
+		r:          raftNode{Node: n, ticker: &time.Ticker{}},
 		attributes: membership.Attributes{Name: "node1", ClientURLs: []string{"http://a", "http://b"}},
 		cluster:    &membership.RaftCluster{},
 		w:          w,
 		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
+
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	srv.publish(time.Hour)
 
@@ -1211,18 +1238,24 @@ func TestPublish(t *testing.T) {
 
 // TestPublishStopped tests that publish will be stopped if server is stopped.
 func TestPublishStopped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
 	srv := &EtcdServer{
 		Cfg: &ServerConfig{TickMs: 1},
 		r: raftNode{
 			Node:      newNodeNop(),
 			transport: rafthttp.NewNopTransporter(),
+			ticker:    &time.Ticker{},
 		},
-		cluster:  &membership.RaftCluster{},
-		w:        mockwait.NewNop(),
-		done:     make(chan struct{}),
-		stopping: make(chan struct{}),
-		stop:     make(chan struct{}),
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		cluster:    &membership.RaftCluster{},
+		w:          mockwait.NewNop(),
+		done:       make(chan struct{}),
+		stopping:   make(chan struct{}),
+		stop:       make(chan struct{}),
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
+
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	close(srv.stopping)
 	srv.publish(time.Hour)
@@ -1230,13 +1263,17 @@ func TestPublishStopped(t *testing.T) {
 
 // TestPublishRetry tests that publish will keep retry until success.
 func TestPublishRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.TODO())
 	n := newNodeRecorderStream()
 	srv := &EtcdServer{
-		Cfg:      &ServerConfig{TickMs: 1},
-		r:        raftNode{Node: n},
-		w:        mockwait.NewNop(),
-		stopping: make(chan struct{}),
-		reqIDGen: idutil.NewGenerator(0, time.Time{}),
+		Cfg:        &ServerConfig{TickMs: 1},
+		r:          raftNode{Node: n, ticker: &time.Ticker{}},
+		w:          mockwait.NewNop(),
+		stopping:   make(chan struct{}),
+		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 	// expect multiple proposals from retrying
 	ch := make(chan struct{})
@@ -1267,14 +1304,19 @@ func TestUpdateVersion(t *testing.T) {
 	// simulate that request has gone through consensus
 	ch <- Response{}
 	w := wait.NewWithResponse(ch)
+	ctx, cancel := context.WithCancel(context.TODO())
 	srv := &EtcdServer{
 		id:         1,
 		Cfg:        &ServerConfig{TickMs: 1},
-		r:          raftNode{Node: n},
+		r:          raftNode{Node: n, ticker: &time.Ticker{}},
 		attributes: membership.Attributes{Name: "node1", ClientURLs: []string{"http://node1.com"}},
 		cluster:    &membership.RaftCluster{},
 		w:          w,
 		reqIDGen:   idutil.NewGenerator(0, time.Time{}),
+		SyncTicker: &time.Ticker{},
+
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	srv.updateClusterVersion("2.0.0")
 

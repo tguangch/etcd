@@ -163,7 +163,7 @@ func testCtl(t *testing.T, testFunc func(ctlCtx), opts ...ctlOption) {
 	}
 	select {
 	case <-time.After(timeout):
-		t.Fatalf("test timed out after %v", timeout)
+		testutil.FatalStack(t, fmt.Sprintf("test timed out after %v", timeout))
 	case <-donec:
 	}
 }
@@ -213,4 +213,25 @@ func (cx *ctlCtx) PrefixArgs() []string {
 
 func isGRPCTimedout(err error) bool {
 	return strings.Contains(err.Error(), "grpc: timed out trying to connect")
+}
+
+func (cx *ctlCtx) memberToRemove() (ep string, memberID string, clusterID string) {
+	n1 := cx.cfg.clusterSize
+	if n1 < 2 {
+		cx.t.Fatalf("%d-node is too small to test 'member remove'", n1)
+	}
+
+	resp, err := getMemberList(*cx)
+	if err != nil {
+		cx.t.Fatal(err)
+	}
+	if n1 != len(resp.Members) {
+		cx.t.Fatalf("expected %d, got %d", n1, len(resp.Members))
+	}
+
+	ep = resp.Members[0].ClientURLs[0]
+	clusterID = fmt.Sprintf("%x", resp.Header.ClusterId)
+	memberID = fmt.Sprintf("%x", resp.Members[1].ID)
+
+	return ep, memberID, clusterID
 }

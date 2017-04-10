@@ -34,6 +34,8 @@ type Cache interface {
 	Get(req *pb.RangeRequest) (*pb.RangeResponse, error)
 	Compact(revision int64)
 	Invalidate(key []byte, endkey []byte)
+	Size() int
+	Close()
 }
 
 // keyFunc returns the key of an request, which is used to look up in the cache for it's caching response.
@@ -52,6 +54,8 @@ func NewCache(maxCacheEntries int) Cache {
 		compactedRev: -1,
 	}
 }
+
+func (c *cache) Close() {}
 
 // cache implements Cache
 type cache struct {
@@ -107,7 +111,7 @@ func (c *cache) Get(req *pb.RangeRequest) (*pb.RangeResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if req.Revision < c.compactedRev {
+	if req.Revision > 0 && req.Revision < c.compactedRev {
 		c.lru.Remove(key)
 		return nil, ErrCompacted
 	}
@@ -153,4 +157,10 @@ func (c *cache) Compact(revision int64) {
 	if revision > c.compactedRev {
 		c.compactedRev = revision
 	}
+}
+
+func (c *cache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lru.Len()
 }

@@ -21,6 +21,9 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
+
+	"golang.org/x/net/context"
 )
 
 func TestResolveTCPAddrs(t *testing.T) {
@@ -124,7 +127,9 @@ func TestResolveTCPAddrs(t *testing.T) {
 			}
 			return &net.TCPAddr{IP: net.ParseIP(tt.hostMap[host]), Port: i, Zone: ""}, nil
 		}
-		urls, err := resolveTCPAddrs(tt.urls)
+		ctx, cancel := context.WithTimeout(context.TODO(), time.Second)
+		urls, err := resolveTCPAddrs(ctx, tt.urls)
+		cancel()
 		if tt.hasError {
 			if err == nil {
 				t.Errorf("expected error")
@@ -145,7 +150,10 @@ func TestURLsEqual(t *testing.T) {
 		"second.com":  "10.0.11.2",
 	}
 	resolveTCPAddr = func(network, addr string) (*net.TCPAddr, error) {
-		host, port, err := net.SplitHostPort(addr)
+		host, port, herr := net.SplitHostPort(addr)
+		if herr != nil {
+			return nil, herr
+		}
 		if _, ok := hostm[host]; !ok {
 			return nil, errors.New("cannot resolve host.")
 		}
@@ -244,14 +252,14 @@ func TestURLsEqual(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := urlsEqual(test.a, test.b)
+		result := urlsEqual(context.TODO(), test.a, test.b)
 		if result != test.expect {
 			t.Errorf("a:%v b:%v, expected %v but %v", test.a, test.b, test.expect, result)
 		}
 	}
 }
 func TestURLStringsEqual(t *testing.T) {
-	result := URLStringsEqual([]string{"http://127.0.0.1:8080"}, []string{"http://127.0.0.1:8080"})
+	result := URLStringsEqual(context.TODO(), []string{"http://127.0.0.1:8080"}, []string{"http://127.0.0.1:8080"})
 	if !result {
 		t.Errorf("unexpected result %v", result)
 	}

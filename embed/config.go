@@ -28,7 +28,9 @@ import (
 	"github.com/coreos/etcd/pkg/netutil"
 	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/pkg/types"
+
 	"github.com/ghodss/yaml"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -55,20 +57,12 @@ var (
 	DefaultInitialAdvertisePeerURLs = "http://localhost:2380"
 	DefaultAdvertiseClientURLs      = "http://localhost:2379"
 
-	defaultHostname   string = "localhost"
+	defaultHostname   string
 	defaultHostStatus error
 )
 
 func init() {
-	ip, err := netutil.GetDefaultHost()
-	if err != nil {
-		defaultHostStatus = err
-		return
-	}
-	// found default host, advertise on it
-	DefaultInitialAdvertisePeerURLs = "http://" + ip + ":2380"
-	DefaultAdvertiseClientURLs = "http://" + ip + ":2379"
-	defaultHostname = ip
+	defaultHostname, defaultHostStatus = netutil.GetDefaultHost()
 }
 
 // Config holds the arguments for configuring an etcd server.
@@ -102,6 +96,7 @@ type Config struct {
 	InitialCluster      string `json:"initial-cluster"`
 	InitialClusterToken string `json:"initial-cluster-token"`
 	StrictReconfigCheck bool   `json:"strict-reconfig-check"`
+	EnableV2            bool   `json:"enable-v2"`
 
 	// security
 
@@ -115,6 +110,7 @@ type Config struct {
 	Debug        bool   `json:"debug"`
 	LogPkgLevels string `json:"log-package-levels"`
 	EnablePprof  bool
+	Metrics      string `json:"metrics"`
 
 	// ForceNewCluster starts a new cluster even if previously started; unsafe.
 	ForceNewCluster bool `json:"force-new-cluster"`
@@ -124,6 +120,18 @@ type Config struct {
 	// The map key is the route path for the handler, and
 	// you must ensure it can't be conflicted with etcd's.
 	UserHandlers map[string]http.Handler `json:"-"`
+	// ServiceRegister is for registering users' gRPC services. A simple usage example:
+	//	cfg := embed.NewConfig()
+	//	cfg.ServerRegister = func(s *grpc.Server) {
+	//		pb.RegisterFooServer(s, &fooServer{})
+	//		pb.RegisterBarServer(s, &barServer{})
+	//	}
+	//	embed.StartEtcd(cfg)
+	ServiceRegister func(*grpc.Server) `json:"-"`
+
+	// auth
+
+	AuthToken string `json:"auth-token"`
 }
 
 // configYAML holds the config suitable for yaml parsing
@@ -173,6 +181,9 @@ func NewConfig() *Config {
 		ClusterState:        ClusterStateFlagNew,
 		InitialClusterToken: "etcd-cluster",
 		StrictReconfigCheck: true,
+		Metrics:             "basic",
+		EnableV2:            true,
+		AuthToken:           "simple",
 	}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	return cfg
@@ -191,6 +202,8 @@ func (cfg *configYAML) configFromFile(path string) error {
 	if err != nil {
 		return err
 	}
+
+	defaultInitialCluster := cfg.InitialCluster
 
 	err = yaml.Unmarshal(b, cfg)
 	if err != nil {
@@ -235,6 +248,10 @@ func (cfg *configYAML) configFromFile(path string) error {
 		cfg.ACUrls = []url.URL(u)
 	}
 
+	// If a discovery flag is set, clear default initial cluster set by InitialClusterFromName
+	if (cfg.Durl != "" || cfg.DNSCluster != "") && cfg.InitialCluster == defaultInitialCluster {
+		cfg.InitialCluster = ""
+	}
 	if cfg.ClusterState == "" {
 		cfg.ClusterState = ClusterStateFlagNew
 	}
@@ -344,16 +361,52 @@ func (cfg Config) InitialClusterFromName(name string) (ret string) {
 func (cfg Config) IsNewCluster() bool { return cfg.ClusterState == ClusterStateFlagNew }
 func (cfg Config) ElectionTicks() int { return int(cfg.ElectionMs / cfg.TickMs) }
 
-// IsDefaultHost returns the default hostname, if used, and the error, if any,
-// from getting the machine's default host.
-func (cfg Config) IsDefaultHost() (string, error) {
-	if len(cfg.APUrls) == 1 && cfg.APUrls[0].String() == DefaultInitialAdvertisePeerURLs {
-		return defaultHostname, defaultHostStatus
+func (cfg Config) defaultPeerHost() bool {
+	return len(cfg.APUrls) == 1 && cfg.APUrls[0].String() == DefaultInitialAdvertisePeerURLs
+}
+
+func (cfg Config) defaultClientHost() bool {
+	return len(cfg.ACUrls) == 1 && cfg.ACUrls[0].String() == DefaultAdvertiseClientURLs
+}
+
+// UpdateDefaultClusterFromName updates cluster advertise URLs with, if available, default host,
+// if advertise URLs are default values(localhost:2379,2380) AND if listen URL is 0.0.0.0.
+// e.g. advertise peer URL localhost:2380 or listen peer URL 0.0.0.0:2380
+// then the advertise peer host would be updated with machine's default host,
+// while keeping the listen URL's port.
+// User can work around this by explicitly setting URL with 127.0.0.1.
+// It returns the default hostname, if used, and the error, if any, from getting the machine's default host.
+// TODO: check whether fields are set instead of whether fields have default value
+func (cfg *Config) UpdateDefaultClusterFromName(defaultInitialCluster string) (string, error) {
+	if defaultHostname == "" || defaultHostStatus != nil {
+		// update 'initial-cluster' when only the name is specified (e.g. 'etcd --name=abc')
+		if cfg.Name != DefaultName && cfg.InitialCluster == defaultInitialCluster {
+			cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
+		}
+		return "", defaultHostStatus
 	}
-	if len(cfg.ACUrls) == 1 && cfg.ACUrls[0].String() == DefaultAdvertiseClientURLs {
-		return defaultHostname, defaultHostStatus
+
+	used := false
+	pip, pport, _ := net.SplitHostPort(cfg.LPUrls[0].Host)
+	if cfg.defaultPeerHost() && pip == "0.0.0.0" {
+		cfg.APUrls[0] = url.URL{Scheme: cfg.APUrls[0].Scheme, Host: fmt.Sprintf("%s:%s", defaultHostname, pport)}
+		used = true
 	}
-	return "", defaultHostStatus
+	// update 'initial-cluster' when only the name is specified (e.g. 'etcd --name=abc')
+	if cfg.Name != DefaultName && cfg.InitialCluster == defaultInitialCluster {
+		cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
+	}
+
+	cip, cport, _ := net.SplitHostPort(cfg.LCUrls[0].Host)
+	if cfg.defaultClientHost() && cip == "0.0.0.0" {
+		cfg.ACUrls[0] = url.URL{Scheme: cfg.ACUrls[0].Scheme, Host: fmt.Sprintf("%s:%s", defaultHostname, cport)}
+		used = true
+	}
+	dhost := defaultHostname
+	if !used {
+		dhost = ""
+	}
+	return dhost, defaultHostStatus
 }
 
 // checkBindURLs returns an error if any URL uses a domain name.
@@ -373,8 +426,7 @@ func checkBindURLs(urls []url.URL) error {
 			continue
 		}
 		if net.ParseIP(host) == nil {
-			err := fmt.Errorf("expected IP in URL for binding (%s)", url.String())
-			plog.Warning(err)
+			return fmt.Errorf("expected IP in URL for binding (%s)", url.String())
 		}
 	}
 	return nil

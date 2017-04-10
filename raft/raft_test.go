@@ -236,7 +236,7 @@ func TestProgressIsPaused(t *testing.T) {
 			Paused: tt.paused,
 			ins:    newInflights(256),
 		}
-		if g := p.isPaused(); g != tt.w {
+		if g := p.IsPaused(); g != tt.w {
 			t.Errorf("#%d: paused= %t, want %t", i, g, tt.w)
 		}
 	}
@@ -260,14 +260,20 @@ func TestProgressResume(t *testing.T) {
 	}
 }
 
-// TestProgressResumeByHeartbeat ensures raft.heartbeat reset progress.paused by heartbeat.
-func TestProgressResumeByHeartbeat(t *testing.T) {
+// TestProgressResumeByHeartbeatResp ensures raft.heartbeat reset progress.paused by heartbeat response.
+func TestProgressResumeByHeartbeatResp(t *testing.T) {
 	r := newTestRaft(1, []uint64{1, 2}, 5, 1, NewMemoryStorage())
 	r.becomeCandidate()
 	r.becomeLeader()
 	r.prs[2].Paused = true
 
 	r.Step(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
+	if !r.prs[2].Paused {
+		t.Errorf("paused = %v, want true", r.prs[2].Paused)
+	}
+
+	r.prs[2].becomeReplicate()
+	r.Step(pb.Message{From: 2, To: 1, Type: pb.MsgHeartbeatResp})
 	if r.prs[2].Paused {
 		t.Errorf("paused = %v, want false", r.prs[2].Paused)
 	}
@@ -313,10 +319,9 @@ func testLeaderElection(t *testing.T, preVote bool) {
 
 		// three logs further along than 0, but in the same term so rejections
 		// are returned instead of the votes being ignored.
-		{newNetworkWithConfig(cfg, nil, ents(1), ents(1), ents(1, 1), nil), StateFollower, 1},
-
-		// logs converge
-		{newNetworkWithConfig(cfg, ents(1), nil, ents(2), ents(1), nil), StateLeader, 2},
+		{newNetworkWithConfig(cfg,
+			nil, entsWithConfig(cfg, 1), entsWithConfig(cfg, 1), entsWithConfig(cfg, 1, 1), nil),
+			StateFollower, 1},
 	}
 
 	for i, tt := range tests {
@@ -378,6 +383,82 @@ func testLeaderCycle(t *testing.T, preVote bool) {
 	}
 }
 
+// TestLeaderElectionOverwriteNewerLogs tests a scenario in which a
+// newly-elected leader does *not* have the newest (i.e. highest term)
+// log entries, and must overwrite higher-term log entries with
+// lower-term ones.
+func TestLeaderElectionOverwriteNewerLogs(t *testing.T) {
+	testLeaderElectionOverwriteNewerLogs(t, false)
+}
+
+func TestLeaderElectionOverwriteNewerLogsPreVote(t *testing.T) {
+	testLeaderElectionOverwriteNewerLogs(t, true)
+}
+
+func testLeaderElectionOverwriteNewerLogs(t *testing.T, preVote bool) {
+	var cfg func(*Config)
+	if preVote {
+		cfg = preVoteConfig
+	}
+	// This network represents the results of the following sequence of
+	// events:
+	// - Node 1 won the election in term 1.
+	// - Node 1 replicated a log entry to node 2 but died before sending
+	//   it to other nodes.
+	// - Node 3 won the second election in term 2.
+	// - Node 3 wrote an entry to its logs but died without sending it
+	//   to any other nodes.
+	//
+	// At this point, nodes 1, 2, and 3 all have uncommitted entries in
+	// their logs and could win an election at term 3. The winner's log
+	// entry overwrites the losers'. (TestLeaderSyncFollowerLog tests
+	// the case where older log entries are overwritten, so this test
+	// focuses on the case where the newer entries are lost).
+	n := newNetworkWithConfig(cfg,
+		entsWithConfig(cfg, 1),     // Node 1: Won first election
+		entsWithConfig(cfg, 1),     // Node 2: Got logs from node 1
+		entsWithConfig(cfg, 2),     // Node 3: Won second election
+		votedWithConfig(cfg, 3, 2), // Node 4: Voted but didn't get logs
+		votedWithConfig(cfg, 3, 2)) // Node 5: Voted but didn't get logs
+
+	// Node 1 campaigns. The election fails because a quorum of nodes
+	// know about the election that already happened at term 2. Node 1's
+	// term is pushed ahead to 2.
+	n.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+	sm1 := n.peers[1].(*raft)
+	if sm1.state != StateFollower {
+		t.Errorf("state = %s, want StateFollower", sm1.state)
+	}
+	if sm1.Term != 2 {
+		t.Errorf("term = %d, want 2", sm1.Term)
+	}
+
+	// Node 1 campaigns again with a higher term. This time it succeeds.
+	n.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+	if sm1.state != StateLeader {
+		t.Errorf("state = %s, want StateLeader", sm1.state)
+	}
+	if sm1.Term != 3 {
+		t.Errorf("term = %d, want 3", sm1.Term)
+	}
+
+	// Now all nodes agree on a log entry with term 1 at index 1 (and
+	// term 3 at index 2).
+	for i := range n.peers {
+		sm := n.peers[i].(*raft)
+		entries := sm.raftLog.allEntries()
+		if len(entries) != 2 {
+			t.Fatalf("node %d: len(entries) == %d, want 2", i, len(entries))
+		}
+		if entries[0].Term != 1 {
+			t.Errorf("node %d: term at index 1 == %d, want 1", i, entries[0].Term)
+		}
+		if entries[1].Term != 3 {
+			t.Errorf("node %d: term at index 2 == %d, want 3", i, entries[1].Term)
+		}
+	}
+}
+
 func TestVoteFromAnyState(t *testing.T) {
 	testVoteFromAnyState(t, pb.MsgVote)
 }
@@ -435,7 +516,7 @@ func testVoteFromAnyState(t *testing.T, vt pb.MessageType) {
 		// If this was a real vote, we reset our state and term.
 		if vt == pb.MsgVote {
 			if r.state != StateFollower {
-				t.Errorf("%s,%s: state %s, want %s", vt, StateFollower, r.state, st)
+				t.Errorf("%s,%s: state %s, want %s", vt, st, r.state, StateFollower)
 			}
 			if r.Term != newTerm {
 				t.Errorf("%s,%s: term %d, want %d", vt, st, r.Term, newTerm)
@@ -1139,44 +1220,78 @@ func TestHandleHeartbeatResp(t *testing.T) {
 		t.Errorf("type = %v, want MsgApp", msgs[0].Type)
 	}
 
-	// A second heartbeat response with no AppResp does not re-send because we are in the wait state.
+	// A second heartbeat response generates another MsgApp re-send
 	sm.Step(pb.Message{From: 2, Type: pb.MsgHeartbeatResp})
 	msgs = sm.readMessages()
-	if len(msgs) != 0 {
-		t.Fatalf("len(msgs) = %d, want 0", len(msgs))
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
 	}
-
-	// Send a heartbeat to reset the wait state; next heartbeat will re-send MsgApp.
-	sm.bcastHeartbeat()
-	sm.Step(pb.Message{From: 2, Type: pb.MsgHeartbeatResp})
-	msgs = sm.readMessages()
-	if len(msgs) != 2 {
-		t.Fatalf("len(msgs) = %d, want 2", len(msgs))
-	}
-	if msgs[0].Type != pb.MsgHeartbeat {
-		t.Errorf("type = %v, want MsgHeartbeat", msgs[0].Type)
-	}
-	if msgs[1].Type != pb.MsgApp {
-		t.Errorf("type = %v, want MsgApp", msgs[1].Type)
+	if msgs[0].Type != pb.MsgApp {
+		t.Errorf("type = %v, want MsgApp", msgs[0].Type)
 	}
 
 	// Once we have an MsgAppResp, heartbeats no longer send MsgApp.
 	sm.Step(pb.Message{
 		From:  2,
 		Type:  pb.MsgAppResp,
-		Index: msgs[1].Index + uint64(len(msgs[1].Entries)),
+		Index: msgs[0].Index + uint64(len(msgs[0].Entries)),
 	})
 	// Consume the message sent in response to MsgAppResp
 	sm.readMessages()
 
-	sm.bcastHeartbeat() // reset wait state
 	sm.Step(pb.Message{From: 2, Type: pb.MsgHeartbeatResp})
 	msgs = sm.readMessages()
+	if len(msgs) != 0 {
+		t.Fatalf("len(msgs) = %d, want 0: %+v", len(msgs), msgs)
+	}
+}
+
+// TestRaftFreesReadOnlyMem ensures raft will free read request from
+// readOnly readIndexQueue and pendingReadIndex map.
+// related issue: https://github.com/coreos/etcd/issues/7571
+func TestRaftFreesReadOnlyMem(t *testing.T) {
+	sm := newTestRaft(1, []uint64{1, 2}, 5, 1, NewMemoryStorage())
+	sm.becomeCandidate()
+	sm.becomeLeader()
+	sm.raftLog.commitTo(sm.raftLog.lastIndex())
+
+	ctx := []byte("ctx")
+
+	// leader starts linearizable read request.
+	// more info: raft dissertation 6.4, step 2.
+	sm.Step(pb.Message{From: 2, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: ctx}}})
+	msgs := sm.readMessages()
 	if len(msgs) != 1 {
-		t.Fatalf("len(msgs) = %d, want 1: %+v", len(msgs), msgs)
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
 	}
 	if msgs[0].Type != pb.MsgHeartbeat {
-		t.Errorf("type = %v, want MsgHeartbeat", msgs[0].Type)
+		t.Fatalf("type = %v, want MsgHeartbeat", msgs[0].Type)
+	}
+	if !bytes.Equal(msgs[0].Context, ctx) {
+		t.Fatalf("Context = %v, want %v", msgs[0].Context, ctx)
+	}
+	if len(sm.readOnly.readIndexQueue) != 1 {
+		t.Fatalf("len(readIndexQueue) = %v, want 1", len(sm.readOnly.readIndexQueue))
+	}
+	if len(sm.readOnly.pendingReadIndex) != 1 {
+		t.Fatalf("len(pendingReadIndex) = %v, want 1", len(sm.readOnly.pendingReadIndex))
+	}
+	if _, ok := sm.readOnly.pendingReadIndex[string(ctx)]; !ok {
+		t.Fatalf("can't find context %v in pendingReadIndex ", ctx)
+	}
+
+	// heartbeat responses from majority of followers (1 in this case)
+	// acknowledge the authority of the leader.
+	// more info: raft dissertation 6.4, step 3.
+	sm.Step(pb.Message{From: 2, Type: pb.MsgHeartbeatResp, Context: ctx})
+	if len(sm.readOnly.readIndexQueue) != 0 {
+		t.Fatalf("len(readIndexQueue) = %v, want 0", len(sm.readOnly.readIndexQueue))
+	}
+	if len(sm.readOnly.pendingReadIndex) != 0 {
+		t.Fatalf("len(pendingReadIndex) = %v, want 0", len(sm.readOnly.pendingReadIndex))
+	}
+	if _, ok := sm.readOnly.pendingReadIndex[string(ctx)]; ok {
+		t.Fatalf("found context %v in pendingReadIndex, want none", ctx)
 	}
 }
 
@@ -1244,10 +1359,6 @@ func TestMsgAppRespWaitReset(t *testing.T) {
 
 func TestRecvMsgVote(t *testing.T) {
 	testRecvMsgVote(t, pb.MsgVote)
-}
-
-func testRecvMsgPreVote(t *testing.T) {
-	testRecvMsgVote(t, pb.MsgPreVote)
 }
 
 func testRecvMsgVote(t *testing.T, msgType pb.MessageType) {
@@ -1403,6 +1514,8 @@ func TestAllServerStepdown(t *testing.T) {
 		switch tt.state {
 		case StateFollower:
 			sm.becomeFollower(1, None)
+		case StatePreCandidate:
+			sm.becomePreCandidate()
 		case StateCandidate:
 			sm.becomeCandidate()
 		case StateLeader:
@@ -1792,6 +1905,81 @@ func TestReadOnlyOptionLeaseWithoutCheckQuorum(t *testing.T) {
 	}
 }
 
+// TestReadOnlyForNewLeader ensures that a leader only accepts MsgReadIndex message
+// when it commits at least one log entry at it term.
+func TestReadOnlyForNewLeader(t *testing.T) {
+	nodeConfigs := []struct {
+		id            uint64
+		committed     uint64
+		applied       uint64
+		compact_index uint64
+	}{
+		{1, 1, 1, 0},
+		{2, 2, 2, 2},
+		{3, 2, 2, 2},
+	}
+	peers := make([]stateMachine, 0)
+	for _, c := range nodeConfigs {
+		storage := NewMemoryStorage()
+		storage.Append([]pb.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}})
+		storage.SetHardState(pb.HardState{Term: 1, Commit: c.committed})
+		if c.compact_index != 0 {
+			storage.Compact(c.compact_index)
+		}
+		cfg := newTestConfig(c.id, []uint64{1, 2, 3}, 10, 1, storage)
+		cfg.Applied = c.applied
+		raft := newRaft(cfg)
+		peers = append(peers, raft)
+	}
+	nt := newNetwork(peers...)
+
+	// Drop MsgApp to forbid peer a to commit any log entry at its term after it becomes leader.
+	nt.ignore(pb.MsgApp)
+	// Force peer a to become leader.
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgHup})
+
+	sm := nt.peers[1].(*raft)
+	if sm.state != StateLeader {
+		t.Fatalf("state = %s, want %s", sm.state, StateLeader)
+	}
+
+	// Ensure peer a drops read only request.
+	var windex uint64 = 4
+	wctx := []byte("ctx")
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: wctx}}})
+	if len(sm.readStates) != 0 {
+		t.Fatalf("len(readStates) = %d, want zero", len(sm.readStates))
+	}
+
+	nt.recover()
+
+	// Force peer a to commit a log entry at its term
+	for i := 0; i < sm.heartbeatTimeout; i++ {
+		sm.tick()
+	}
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{}}})
+	if sm.raftLog.committed != 4 {
+		t.Fatalf("committed = %d, want 4", sm.raftLog.committed)
+	}
+	lastLogTerm := sm.raftLog.zeroTermOnErrCompacted(sm.raftLog.term(sm.raftLog.committed))
+	if lastLogTerm != sm.Term {
+		t.Fatalf("last log term = %d, want %d", lastLogTerm, sm.Term)
+	}
+
+	// Ensure peer a accepts read only request after it commits a entry at its term.
+	nt.send(pb.Message{From: 1, To: 1, Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: wctx}}})
+	if len(sm.readStates) != 1 {
+		t.Fatalf("len(readStates) = %d, want 1", len(sm.readStates))
+	}
+	rs := sm.readStates[0]
+	if rs.Index != windex {
+		t.Fatalf("readIndex = %d, want %d", rs.Index, windex)
+	}
+	if !bytes.Equal(rs.RequestCtx, wctx) {
+		t.Fatalf("requestCtx = %v, want %v", rs.RequestCtx, wctx)
+	}
+}
+
 func TestLeaderAppResp(t *testing.T) {
 	// initial progress: match = 0; next = 3
 	tests := []struct {
@@ -1988,15 +2176,19 @@ func TestSendAppendForProgressProbe(t *testing.T) {
 
 	// each round is a heartbeat
 	for i := 0; i < 3; i++ {
-		// we expect that raft will only send out one msgAPP per heartbeat timeout
-		r.appendEntry(pb.Entry{Data: []byte("somedata")})
-		r.sendAppend(2)
-		msg := r.readMessages()
-		if len(msg) != 1 {
-			t.Errorf("len(msg) = %d, want %d", len(msg), 1)
-		}
-		if msg[0].Index != 0 {
-			t.Errorf("index = %d, want %d", msg[0].Index, 0)
+		if i == 0 {
+			// we expect that raft will only send out one msgAPP on the first
+			// loop. After that, the follower is paused until a heartbeat response is
+			// received.
+			r.appendEntry(pb.Entry{Data: []byte("somedata")})
+			r.sendAppend(2)
+			msg := r.readMessages()
+			if len(msg) != 1 {
+				t.Errorf("len(msg) = %d, want %d", len(msg), 1)
+			}
+			if msg[0].Index != 0 {
+				t.Errorf("index = %d, want %d", msg[0].Index, 0)
+			}
 		}
 
 		if !r.prs[2].Paused {
@@ -2014,14 +2206,31 @@ func TestSendAppendForProgressProbe(t *testing.T) {
 		for j := 0; j < r.heartbeatTimeout; j++ {
 			r.Step(pb.Message{From: 1, To: 1, Type: pb.MsgBeat})
 		}
+		if !r.prs[2].Paused {
+			t.Errorf("paused = %v, want true", r.prs[2].Paused)
+		}
+
 		// consume the heartbeat
-		msg = r.readMessages()
+		msg := r.readMessages()
 		if len(msg) != 1 {
 			t.Errorf("len(msg) = %d, want %d", len(msg), 1)
 		}
 		if msg[0].Type != pb.MsgHeartbeat {
 			t.Errorf("type = %v, want %v", msg[0].Type, pb.MsgHeartbeat)
 		}
+	}
+
+	// a heartbeat response will allow another message to be sent
+	r.Step(pb.Message{From: 2, To: 1, Type: pb.MsgHeartbeatResp})
+	msg := r.readMessages()
+	if len(msg) != 1 {
+		t.Errorf("len(msg) = %d, want %d", len(msg), 1)
+	}
+	if msg[0].Index != 0 {
+		t.Errorf("index = %d, want %d", msg[0].Index, 0)
+	}
+	if !r.prs[2].Paused {
+		t.Errorf("paused = %v, want true", r.prs[2].Paused)
 	}
 }
 
@@ -2850,13 +3059,32 @@ func TestTransferNonMember(t *testing.T) {
 	}
 }
 
-func ents(terms ...uint64) *raft {
+func entsWithConfig(configFunc func(*Config), terms ...uint64) *raft {
 	storage := NewMemoryStorage()
 	for i, term := range terms {
 		storage.Append([]pb.Entry{{Index: uint64(i + 1), Term: term}})
 	}
-	sm := newTestRaft(1, []uint64{}, 5, 1, storage)
+	cfg := newTestConfig(1, []uint64{}, 5, 1, storage)
+	if configFunc != nil {
+		configFunc(cfg)
+	}
+	sm := newRaft(cfg)
 	sm.reset(terms[len(terms)-1])
+	return sm
+}
+
+// votedWithConfig creates a raft state machine with Vote and Term set
+// to the given value but no log entries (indicating that it voted in
+// the given term but has not received any logs).
+func votedWithConfig(configFunc func(*Config), vote, term uint64) *raft {
+	storage := NewMemoryStorage()
+	storage.SetHardState(pb.HardState{Vote: vote, Term: term})
+	cfg := newTestConfig(1, []uint64{}, 5, 1, storage)
+	if configFunc != nil {
+		configFunc(cfg)
+	}
+	sm := newRaft(cfg)
+	sm.reset(term)
 	return sm
 }
 

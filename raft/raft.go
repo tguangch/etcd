@@ -367,7 +367,7 @@ func (r *raft) send(m pb.Message) {
 // sendAppend sends RPC, with entries to the given peer.
 func (r *raft) sendAppend(to uint64) {
 	pr := r.prs[to]
-	if pr.isPaused() {
+	if pr.IsPaused() {
 		return
 	}
 	m := pb.Message{}
@@ -469,7 +469,6 @@ func (r *raft) bcastHeartbeatWithCtx(ctx []byte) {
 			continue
 		}
 		r.sendHeartbeat(id, ctx)
-		r.prs[id].resume()
 	}
 }
 
@@ -824,6 +823,11 @@ func stepLeader(r *raft, m pb.Message) {
 		return
 	case pb.MsgReadIndex:
 		if r.quorum() > 1 {
+			if r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.committed)) != r.Term {
+				// Reject read only request when this leader has not committed any log entry at its term.
+				return
+			}
+
 			// thinking: use an interally defined context instead of the user given context.
 			// We can express this in terms of the term and index instead of a user-supplied value.
 			// This would allow multiple reads to piggyback on the same message.
@@ -870,7 +874,7 @@ func stepLeader(r *raft, m pb.Message) {
 				r.sendAppend(m.From)
 			}
 		} else {
-			oldPaused := pr.isPaused()
+			oldPaused := pr.IsPaused()
 			if pr.maybeUpdate(m.Index) {
 				switch {
 				case pr.State == ProgressStateProbe:
@@ -898,6 +902,7 @@ func stepLeader(r *raft, m pb.Message) {
 		}
 	case pb.MsgHeartbeatResp:
 		pr.RecentActive = true
+		pr.resume()
 
 		// free one slot for the full inflights window to allow progress.
 		if pr.State == ProgressStateReplicate && pr.ins.full() {

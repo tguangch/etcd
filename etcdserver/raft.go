@@ -113,7 +113,7 @@ type raftNode struct {
 	readStateC chan raft.ReadState
 
 	// utility
-	ticker <-chan time.Time
+	ticker *time.Ticker
 	// contention detectors for raft heartbeat message
 	td          *contention.TimeoutDetector
 	heartbeat   time.Duration // for logging
@@ -135,14 +135,16 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 	r.applyc = make(chan apply)
 	r.stopped = make(chan struct{})
 	r.done = make(chan struct{})
+	internalTimeout := time.Second
 
 	go func() {
 		defer r.onStop()
 		islead := false
+		isCandidate := false
 
 		for {
 			select {
-			case <-r.ticker:
+			case <-r.ticker.C:
 				r.Tick()
 			case rd := <-r.Ready():
 				if rd.SoftState != nil {
@@ -161,12 +163,15 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 
 					atomic.StoreUint64(&r.lead, rd.SoftState.Lead)
 					islead = rd.RaftState == raft.StateLeader
-					rh.leadershipUpdate()
+					isCandidate = rd.RaftState == raft.StateCandidate
+					rh.updateLeadership()
 				}
 
 				if len(rd.ReadStates) != 0 {
 					select {
 					case r.readStateC <- rd.ReadStates[len(rd.ReadStates)-1]:
+					case <-time.After(internalTimeout):
+						plog.Warningf("timed out sending read state")
 					case <-r.stopped:
 						return
 					}
@@ -178,6 +183,8 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 					snapshot: rd.Snapshot,
 					raftDone: raftDone,
 				}
+
+				updateCommittedIndex(&ap, rh)
 
 				select {
 				case r.applyc <- ap:
@@ -220,12 +227,35 @@ func (r *raftNode) start(rh *raftReadyHandler) {
 					r.sendMessages(rd.Messages)
 				}
 				raftDone <- struct{}{}
+
 				r.Advance()
+
+				if isCandidate {
+					// candidate needs to wait for all pending configuration changes to be applied
+					// before continue. Or we might incorrectly count the number of votes (e.g. receive vote from
+					// a removed member).
+					// We simply wait for ALL pending entries to be applied for now.
+					// We might improve this later on if it causes unnecessary long blocking issues.
+					rh.waitForApply()
+				}
 			case <-r.stopped:
 				return
 			}
 		}
 	}()
+}
+
+func updateCommittedIndex(ap *apply, rh *raftReadyHandler) {
+	var ci uint64
+	if len(ap.entries) != 0 {
+		ci = ap.entries[len(ap.entries)-1].Index
+	}
+	if ap.snapshot.Metadata.Index > ci {
+		ci = ap.snapshot.Metadata.Index
+	}
+	if ci != 0 {
+		rh.updateCommittedIndex(ci)
+	}
 }
 
 func (r *raftNode) sendMessages(ms []raftpb.Message) {
@@ -285,6 +315,7 @@ func (r *raftNode) stop() {
 
 func (r *raftNode) onStop() {
 	r.Stop()
+	r.ticker.Stop()
 	r.transport.Stop()
 	if err := r.storage.Close(); err != nil {
 		plog.Panicf("raft close storage error: %v", err)
