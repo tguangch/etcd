@@ -12,10 +12,9 @@ The easiest way to get started using etcd as a distributed key-value store is to
 
  - [Setting up local clusters][local_cluster]
  - [Interacting with etcd][interacting]
- - [gRPC API references][api_ref]
- - [HTTP JSON API through the gRPC gateway][api_grpc_gateway]
+ - [API references][api_ref]
+ - [gRPC gateway][api_grpc_gateway]
  - [gRPC naming and discovery][grpc_naming]
- - [Client][namespace_client] and [proxy][namespace_proxy] namespacing
  - [Embedding etcd][embed_etcd]
  - [Experimental features and APIs][experimental]
  - [System limits][system-limit]
@@ -26,12 +25,11 @@ Administrators who need to create reliable and scalable key-value stores for the
 
  - [Setting up etcd clusters][clustering]
  - [Setting up etcd gateways][gateway]
- - [Setting up etcd gRPC proxy][grpc_proxy]
+ - [Setting up etcd gRPC proxy (pre-alpha)][grpc_proxy]
  - [Run etcd clusters inside containers][container]
  - [Hardware recommendations][hardware]
  - [Configuration][conf]
  - [Security][security]
- - [Authentication][authentication]
  - [Monitoring][monitoring]
  - [Maintenance][maintenance]
  - [Understand failures][failures]
@@ -48,8 +46,7 @@ To learn more about the concepts and internals behind etcd, read the following p
  - [Understand data model][data_model]
  - [Understand APIs][understand_apis]
  - [Glossary][glossary]
- - Internals
-   - [Auth subsystem][auth_design]
+ - Internals (TODO)
 
 ## Upgrading and compatibility
 
@@ -76,8 +73,6 @@ Answers to [common questions] about etcd.
 [failures]: op-guide/failures.md
 [gateway]: op-guide/gateway.md
 [glossary]: learning/glossary.md
-[namespace_client]: https://godoc.org/github.com/coreos/etcd/clientv3/namespace
-[namespace_proxy]: op-guide/grpc_proxy.md#namespacing
 [grpc_proxy]: op-guide/grpc_proxy.md
 [hardware]: op-guide/hardware.md
 [interacting]: dev-guide/interacting_v3.md
@@ -95,5 +90,3 @@ Answers to [common questions] about etcd.
 [experimental]: dev-guide/experimental_apis.md
 [v3_upgrade]: upgrades/upgrade_3_0.md
 [v31_upgrade]: upgrades/upgrade_3_1.md
-[authentication]: op-guide/authentication.md
-[auth_design]: learning/auth_design.md

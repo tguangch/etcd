@@ -20,12 +20,10 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
-	"sync"
 
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/etcdserver/api/v2http"
 	"github.com/coreos/etcd/pkg/cors"
-	"github.com/coreos/etcd/pkg/debugutil"
 	runtimeutil "github.com/coreos/etcd/pkg/runtime"
 	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/pkg/types"
@@ -56,11 +54,8 @@ type Etcd struct {
 	Server  *etcdserver.EtcdServer
 
 	cfg   Config
-	stopc chan struct{}
 	errc  chan error
 	sctxs map[string]*serveCtx
-
-	closeOnce sync.Once
 }
 
 // StartEtcd launches the etcd server and HTTP handlers for client/server communication.
@@ -70,7 +65,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 	if err = inCfg.Validate(); err != nil {
 		return nil, err
 	}
-	e = &Etcd{cfg: *inCfg, stopc: make(chan struct{})}
+	e = &Etcd{cfg: *inCfg}
 	cfg := &e.cfg
 	defer func() {
 		if e != nil && err != nil {
@@ -123,7 +118,6 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		QuotaBackendBytes:       cfg.QuotaBackendBytes,
 		StrictReconfigCheck:     cfg.StrictReconfigCheck,
 		ClientCertAuthEnabled:   cfg.ClientTLSInfo.ClientCertAuth,
-		AuthToken:               cfg.AuthToken,
 	}
 
 	if e.Server, err = etcdserver.NewServer(srvcfg); err != nil {
@@ -146,8 +140,6 @@ func (e *Etcd) Config() Config {
 }
 
 func (e *Etcd) Close() {
-	e.closeOnce.Do(func() { close(e.stopc) })
-
 	for _, sctx := range e.sctxs {
 		sctx.cancel()
 	}
@@ -238,7 +230,7 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 	}
 
 	if cfg.EnablePprof {
-		plog.Infof("pprof is enabled under %s", debugutil.HTTPPrefixPProf)
+		plog.Infof("pprof is enabled under %s", pprofPrefix)
 	}
 
 	sctxs = make(map[string]*serveCtx)
@@ -258,21 +250,19 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 		}
 
 		proto := "tcp"
-		addr := u.Host
 		if u.Scheme == "unix" || u.Scheme == "unixs" {
 			proto = "unix"
-			addr = u.Host + u.Path
 		}
 
 		sctx.secure = u.Scheme == "https" || u.Scheme == "unixs"
 		sctx.insecure = !sctx.secure
-		if oldctx := sctxs[addr]; oldctx != nil {
+		if oldctx := sctxs[u.Host]; oldctx != nil {
 			oldctx.secure = oldctx.secure || sctx.secure
 			oldctx.insecure = oldctx.insecure || sctx.insecure
 			continue
 		}
 
-		if sctx.l, err = net.Listen(proto, addr); err != nil {
+		if sctx.l, err = net.Listen(proto, u.Host); err != nil {
 			return nil, err
 		}
 
@@ -299,14 +289,10 @@ func startClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err error) {
 		for k := range cfg.UserHandlers {
 			sctx.userHandlers[k] = cfg.UserHandlers[k]
 		}
-		sctx.serviceRegister = cfg.ServiceRegister
-		if cfg.EnablePprof || cfg.Debug {
+		if cfg.EnablePprof {
 			sctx.registerPprof()
 		}
-		if cfg.Debug {
-			sctx.registerTrace()
-		}
-		sctxs[addr] = sctx
+		sctxs[u.Host] = sctx
 	}
 	return sctxs, nil
 }
@@ -328,36 +314,21 @@ func (e *Etcd) serve() (err error) {
 	ph := v2http.NewPeerHandler(e.Server)
 	for _, l := range e.Peers {
 		go func(l net.Listener) {
-			e.errHandler(servePeerHTTP(l, ph))
+			e.errc <- servePeerHTTP(l, ph)
 		}(l)
 	}
 
 	// Start a client server goroutine for each listen address
-	var v2h http.Handler
-	if e.Config().EnableV2 {
-		v2h = http.Handler(&cors.CORSHandler{
-			Handler: v2http.NewClientHandler(e.Server, e.Server.Cfg.ReqTimeout()),
-			Info:    e.cfg.CorsInfo,
-		})
-	}
+	ch := http.Handler(&cors.CORSHandler{
+		Handler: v2http.NewClientHandler(e.Server, e.Server.Cfg.ReqTimeout()),
+		Info:    e.cfg.CorsInfo,
+	})
 	for _, sctx := range e.sctxs {
 		// read timeout does not work with http close notify
 		// TODO: https://github.com/golang/go/issues/9524
 		go func(s *serveCtx) {
-			e.errHandler(s.serve(e.Server, ctlscfg, v2h, e.errHandler))
+			e.errc <- s.serve(e.Server, ctlscfg, ch, e.errc)
 		}(sctx)
 	}
 	return nil
-}
-
-func (e *Etcd) errHandler(err error) {
-	select {
-	case <-e.stopc:
-		return
-	default:
-	}
-	select {
-	case <-e.stopc:
-	case e.errc <- err:
-	}
 }

@@ -28,9 +28,7 @@ import (
 	"github.com/coreos/etcd/pkg/netutil"
 	"github.com/coreos/etcd/pkg/transport"
 	"github.com/coreos/etcd/pkg/types"
-
 	"github.com/ghodss/yaml"
-	"google.golang.org/grpc"
 )
 
 const (
@@ -96,7 +94,6 @@ type Config struct {
 	InitialCluster      string `json:"initial-cluster"`
 	InitialClusterToken string `json:"initial-cluster-token"`
 	StrictReconfigCheck bool   `json:"strict-reconfig-check"`
-	EnableV2            bool   `json:"enable-v2"`
 
 	// security
 
@@ -120,18 +117,6 @@ type Config struct {
 	// The map key is the route path for the handler, and
 	// you must ensure it can't be conflicted with etcd's.
 	UserHandlers map[string]http.Handler `json:"-"`
-	// ServiceRegister is for registering users' gRPC services. A simple usage example:
-	//	cfg := embed.NewConfig()
-	//	cfg.ServerRegister = func(s *grpc.Server) {
-	//		pb.RegisterFooServer(s, &fooServer{})
-	//		pb.RegisterBarServer(s, &barServer{})
-	//	}
-	//	embed.StartEtcd(cfg)
-	ServiceRegister func(*grpc.Server) `json:"-"`
-
-	// auth
-
-	AuthToken string `json:"auth-token"`
 }
 
 // configYAML holds the config suitable for yaml parsing
@@ -182,8 +167,6 @@ func NewConfig() *Config {
 		InitialClusterToken: "etcd-cluster",
 		StrictReconfigCheck: true,
 		Metrics:             "basic",
-		EnableV2:            true,
-		AuthToken:           "simple",
 	}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	return cfg
@@ -202,8 +185,6 @@ func (cfg *configYAML) configFromFile(path string) error {
 	if err != nil {
 		return err
 	}
-
-	defaultInitialCluster := cfg.InitialCluster
 
 	err = yaml.Unmarshal(b, cfg)
 	if err != nil {
@@ -248,8 +229,7 @@ func (cfg *configYAML) configFromFile(path string) error {
 		cfg.ACUrls = []url.URL(u)
 	}
 
-	// If a discovery flag is set, clear default initial cluster set by InitialClusterFromName
-	if (cfg.Durl != "" || cfg.DNSCluster != "") && cfg.InitialCluster == defaultInitialCluster {
+	if (cfg.Durl != "" || cfg.DNSCluster != "") && cfg.InitialCluster == cfg.InitialClusterFromName(cfg.Name) {
 		cfg.InitialCluster = ""
 	}
 	if cfg.ClusterState == "" {
@@ -426,7 +406,8 @@ func checkBindURLs(urls []url.URL) error {
 			continue
 		}
 		if net.ParseIP(host) == nil {
-			return fmt.Errorf("expected IP in URL for binding (%s)", url.String())
+			err := fmt.Errorf("expected IP in URL for binding (%s)", url.String())
+			plog.Warning(err)
 		}
 	}
 	return nil
